@@ -38,8 +38,8 @@ async fn run() -> anyhow::Result<()> {
             id INTEGER,
             x INTEGER,
             y INTEGER,
-            x1 INTEGER,
-            y1 INTEGER,
+            width INTEGER,
+            height INTEGER,
             color INTEGER
         )
         "#
@@ -93,7 +93,7 @@ async fn read_csv_gzip_file(file_path: &str, map: &mut HashMap<String, i64>, cou
         for record in chunk {
             let r = record?;
             let pix = read_record(r, map, count)?;
-            let q = sqlx::query("INSERT INTO pixels (timestamp, id, x, y, x0, x1, color) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+            let q = sqlx::query("INSERT INTO pixels (timestamp, id, x, y, width, height, color) VALUES ($1, $2, $3, $4, $5, $6, $7)")
             .bind(pix.timestamp)
             .bind(pix.id)
             .bind(pix.x)
