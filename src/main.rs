@@ -3,49 +3,17 @@ use std::{
     io::{self, BufReader},
     time::{Instant, Duration}, collections::HashMap,
 };
-use itertools::Itertools;
 use num_enum::IntoPrimitive;
 use num_enum::TryFromPrimitive;
 use anyhow::{anyhow, Ok};
 use chrono::TimeZone;
-use chrono::Timelike;
 use chrono::Utc;
 use csv::{ReaderBuilder, StringRecord};
 use flate2::read::GzDecoder;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
-use sqlx::{sqlite::SqlitePoolOptions, Pool, Sqlite};
 
-#[tokio::main]
-async fn main() {
-    run().await.unwrap();
-}
-
-async fn run() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let entries = std::fs::read_dir("..")?;
-
-    std::fs::File::create("db.sqlite")?;
-
-    let pool = SqlitePoolOptions::new()
-    .max_connections(5)
-    .acquire_timeout(Duration::from_secs(3))
-    .connect("sqlite://db.sqlite")
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS pixels (
-            timestamp INTEGER,
-            id INTEGER,
-            x INTEGER,
-            y INTEGER,
-            width INTEGER,
-            height INTEGER,
-            color INTEGER
-        )
-        "#
-    )
-    .execute(&pool)
-    .await?;
 
     let file_paths: Vec<String> = entries
         .filter_map(|e| {
@@ -72,40 +40,24 @@ async fn run() -> anyhow::Result<()> {
 
     for f in file_paths.iter() {
         println!("file: {}", fc);
-        read_csv_gzip_file(f, &mut map, &mut count, &pool).await?;
+        read_csv_gzip_file(f, &mut map, &mut count)?;
         fc+= 1;
     }
 
     Ok(())
 }
 
-async fn read_csv_gzip_file(file_path: &str, map: &mut HashMap<String, i64>, count: &mut i64, pool: &Pool<Sqlite>) -> anyhow::Result<()> {
+fn read_csv_gzip_file(file_path: &str, map: &mut HashMap<String, i64>, count: &mut i64) -> anyhow::Result<()> {
     let file = File::open(file_path)?;
     let gz_decoder = GzDecoder::new(file);
     let reader = BufReader::new(gz_decoder);
     let mut csv_reader = ReaderBuilder::new().from_reader(reader);
     dbg!(csv_reader.headers()?);
 
-    let mut chunks = csv_reader.records().chunks(100_000);
-
-    for chunk in  chunks.into_iter() {
-        let mut transaction = pool.begin().await?;
-        for record in chunk {
-            let r = record?;
-            let pix = read_record(r, map, count)?;
-            let q = sqlx::query("INSERT INTO pixels (timestamp, id, x, y, width, height, color) VALUES ($1, $2, $3, $4, $5, $6, $7)")
-            .bind(pix.timestamp)
-            .bind(pix.id)
-            .bind(pix.x)
-            .bind(pix.y)
-            .bind(pix.x1)
-            .bind(pix.y1)
-            .bind(pix.color)
-            .execute(&mut *transaction).await;
-        }
-        transaction.commit().await?;
-        println!("transaction");
+    for record in csv_reader.records() {
+        let _pix = read_record(record?, map, count)?;
     }
+
 
     Ok(())
 }
@@ -224,7 +176,7 @@ fn read_color(text: &str) -> anyhow::Result<u32> {
     Ok(get_color_id(color)) */
 }
 
-#[derive(Debug, Clone, Copy, sqlx::FromRow)]
+#[derive(Debug, Clone, Copy)]
 struct RedditPixel {
     timestamp: i64,
     id: i64,
