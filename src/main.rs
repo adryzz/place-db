@@ -186,7 +186,7 @@ fn read_coords(text: &str) -> anyhow::Result<(i32, i32, i32, i32)> {
         1 => {
             let first = &text[0..comma_indices[0]];
             let second = &text[comma_indices[0]+1..];
-            Ok((i32::from_str_radix(first, 10)?, i32::from_str_radix(second, 10)?, 0, 0))
+            Ok((i32::from_str_radix(first, 10)?, i32::from_str_radix(second, 10)?, i32::MAX, i32::MAX))
         }
         2 => {
             // these idiots put JSON in my CSV ffs
