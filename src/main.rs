@@ -1,8 +1,9 @@
 use std::{
     fs::File,
     io::{self, BufReader},
-    time::Instant, collections::HashMap,
+    time::{Instant, Duration}, collections::HashMap,
 };
+use itertools::Itertools;
 use num_enum::IntoPrimitive;
 use num_enum::TryFromPrimitive;
 use anyhow::{anyhow, Ok};
@@ -12,9 +13,39 @@ use chrono::Utc;
 use csv::{ReaderBuilder, StringRecord};
 use flate2::read::GzDecoder;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use sqlx::{sqlite::SqlitePoolOptions, Pool, Sqlite};
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() {
+    run().await.unwrap();
+}
+
+async fn run() -> anyhow::Result<()> {
     let entries = std::fs::read_dir("..")?;
+
+    std::fs::File::create("db.sqlite")?;
+
+    let pool = SqlitePoolOptions::new()
+    .max_connections(5)
+    .acquire_timeout(Duration::from_secs(3))
+    .connect("sqlite://db.sqlite")
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS pixels (
+            timestamp INTEGER,
+            id INTEGER,
+            x INTEGER,
+            y INTEGER,
+            x1 INTEGER,
+            y1 INTEGER,
+            color INTEGER
+        )
+        "#
+    )
+    .execute(&pool)
+    .await?;
 
     let file_paths: Vec<String> = entries
         .filter_map(|e| {
@@ -35,34 +66,51 @@ fn main() -> anyhow::Result<()> {
 
     dbg!(&file_paths);
 
-    let mut map: HashMap<String, u64> = HashMap::with_capacity(500000);
-    let mut count = 0u64;
+    let mut map: HashMap<String, i64> = HashMap::with_capacity(500000);
+    let mut count = 0i64;
     let mut fc = 0;
 
     for f in file_paths.iter() {
         println!("file: {}", fc);
-        read_csv_gzip_file(f, &mut map, &mut count)?;
+        read_csv_gzip_file(f, &mut map, &mut count, &pool).await?;
         fc+= 1;
     }
 
     Ok(())
 }
 
-fn read_csv_gzip_file(file_path: &str, map: &mut HashMap<String, u64>, count: &mut u64) -> anyhow::Result<()> {
+async fn read_csv_gzip_file(file_path: &str, map: &mut HashMap<String, i64>, count: &mut i64, pool: &Pool<Sqlite>) -> anyhow::Result<()> {
     let file = File::open(file_path)?;
     let gz_decoder = GzDecoder::new(file);
     let reader = BufReader::new(gz_decoder);
     let mut csv_reader = ReaderBuilder::new().from_reader(reader);
     dbg!(csv_reader.headers()?);
-    for record in csv_reader.records() {
-        let record = record?;
-        read_record(record, map, count)?;
+
+    let mut chunks = csv_reader.records().chunks(100_000);
+
+    for chunk in  chunks.into_iter() {
+        let mut transaction = pool.begin().await?;
+        for record in chunk {
+            let r = record?;
+            let pix = read_record(r, map, count)?;
+            let q = sqlx::query("INSERT INTO pixels (timestamp, id, x, y, width, height, color) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+            .bind(pix.timestamp)
+            .bind(pix.id)
+            .bind(pix.x)
+            .bind(pix.y)
+            .bind(pix.x1)
+            .bind(pix.y1)
+            .bind(pix.color)
+            .execute(&mut *transaction).await;
+        }
+        transaction.commit().await?;
+        println!("transaction");
     }
 
     Ok(())
 }
 
-fn read_record(record: StringRecord, map: &mut HashMap<String, u64>, count: &mut u64) -> anyhow::Result<RedditPixel> {
+fn read_record(record: StringRecord, map: &mut HashMap<String, i64>, count: &mut i64) -> anyhow::Result<RedditPixel> {
     let a = record.get(0).ok_or(anyhow!("bad format"))?;
     let timestamp = date_components_to_timestamp(read_date(a)?)?;
 
@@ -87,7 +135,10 @@ fn read_record(record: StringRecord, map: &mut HashMap<String, u64>, count: &mut
     Ok(RedditPixel {
         timestamp,
         id,
-        coords,
+        x: coords.0,
+        y: coords.1,
+        x1: coords.2,
+        y1: coords.3,
         color
     })
 }
@@ -113,14 +164,13 @@ fn read_date(text: &str) -> anyhow::Result<[u32; 7]> {
     Err(anyhow!("bad date"))
 }
 
-fn date_components_to_timestamp(c: [u32; 7]) -> anyhow::Result<u64> {
+fn date_components_to_timestamp(c: [u32; 7]) -> anyhow::Result<i64> {
     let dt = Utc
         .with_ymd_and_hms(c[0].try_into()?, c[1], c[2], c[3], c[4], c[5])
         .earliest()
         .ok_or(anyhow!(""))?;
 
-    let ms: u64 = dt.timestamp_millis().try_into()?;
-    Ok(ms + (c[6] as u64))
+    Ok(dt.timestamp_millis() + (c[6] as i64))
 }
 
 fn read_coords(text: &str) -> anyhow::Result<(i32, i32, i32, i32)> {
@@ -150,15 +200,15 @@ fn read_coords(text: &str) -> anyhow::Result<(i32, i32, i32, i32)> {
             let first = &text[colon_indices[0]+2..comma_indices[0]];
             let second = &text[colon_indices[1]+2..comma_indices[1]];
             let third = &text[colon_indices[2]+2..text.len()-1];
-            println!("Mod circle");
-            Ok((i32::from_str_radix(first, 10)?, i32::from_str_radix(second, 10)?, i32::from_str_radix(third, 10)?, -1))
+            //println!("Mod circle");
+            Ok((i32::from_str_radix(first, 10)?, i32::from_str_radix(second, 10)?, i32::from_str_radix(third, 10)?, i32::MAX))
         }
         3 => {
             let first = &text[0..comma_indices[0]];
             let second = &text[comma_indices[0]+1..comma_indices[1]];
             let third = &text[comma_indices[1]+1..comma_indices[2]];
             let fourth = &text[comma_indices[2]+1..];
-            println!("Mod rectangle");
+            //println!("Mod rectangle");
             Ok((i32::from_str_radix(first, 10)?, i32::from_str_radix(second, 10)?, i32::from_str_radix(third, 10)?, i32::from_str_radix(fourth, 10)?))
         }
         _ => Err(anyhow!("formatting error"))
@@ -176,9 +226,12 @@ fn read_color(text: &str) -> anyhow::Result<u32> {
 
 #[derive(Debug, Clone, Copy, sqlx::FromRow)]
 struct RedditPixel {
-    timestamp: u64,
-    id: u64,
-    coords: (i32, i32, i32, i32),
+    timestamp: i64,
+    id: i64,
+    x: i32,
+    y: i32,
+    x1: i32,
+    y1: i32,
     color: u32
 }
 
