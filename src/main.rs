@@ -1,16 +1,19 @@
-use std::{
-    fs::File,
-    io::{self, BufReader},
-    time::{Instant, Duration}, collections::HashMap,
-};
-use num_enum::IntoPrimitive;
-use num_enum::TryFromPrimitive;
 use anyhow::{anyhow, Ok};
 use chrono::TimeZone;
 use chrono::Utc;
 use csv::{ReaderBuilder, StringRecord};
 use flate2::read::GzDecoder;
+use itertools::Itertools;
+use num_enum::IntoPrimitive;
+use num_enum::TryFromPrimitive;
+use num_integer::Roots;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{self, stdout, BufReader, BufWriter, Stdout, Write},
+    time::{Duration, Instant},
+};
 
 fn main() -> anyhow::Result<()> {
     let entries = std::fs::read_dir("..")?;
@@ -32,57 +35,101 @@ fn main() -> anyhow::Result<()> {
         .map(|a| format!("../{}", a))
         .collect();
 
-    dbg!(&file_paths);
+    //dbg!(&file_paths);
+    let mut m = vec![0u16; 3000 * 2000];
 
-    let mut map: HashMap<String, i64> = HashMap::with_capacity(500000);
-    let mut count = 0i64;
-    let mut fc = 0;
+    let mut writer = BufWriter::new(stdout());
 
-    for f in file_paths.iter() {
-        println!("file: {}", fc);
-        read_csv_gzip_file(f, &mut map, &mut count)?;
-        fc+= 1;
+    for s in file_paths.iter() {
+        eprintln!("opening {}", s);
+        read_csv_gzip_file(s, &mut m[..], &mut writer)?;
     }
+
+    /*file_paths.par_iter().for_each(|s| {
+        //println!("opening {}", s);
+        read_csv_gzip_file(s, &mut map).unwrap();
+    });*/
+    //println!("finished reading files, generating heatmap...");
 
     Ok(())
 }
 
-fn read_csv_gzip_file(file_path: &str, map: &mut HashMap<String, i64>, count: &mut i64) -> anyhow::Result<()> {
+pub fn convert<'a>(data: &'a [u32]) -> &'a [u8] {
+    unsafe { &mut std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) }
+}
+
+fn read_csv_gzip_file(
+    file_path: &str,
+    map: &mut [u16],
+    w: &mut BufWriter<Stdout>,
+) -> anyhow::Result<()> {
     let file = File::open(file_path)?;
     let gz_decoder = GzDecoder::new(file);
     let reader = BufReader::new(gz_decoder);
     let mut csv_reader = ReaderBuilder::new().from_reader(reader);
-    dbg!(csv_reader.headers()?);
+
+    let mut img_buf = [0u32; 8];
+
+    let mut last_timestamp = 0i64;
 
     for record in csv_reader.records() {
-        let _pix = read_record(record?, map, count)?;
-    }
+        let pix = read_record(record?)?;
+        let x = pix.x + 1500;
+        let y = pix.y + 1000;
+        map[((y * 3000) + x) as usize] += 1;
 
+        if pix.timestamp > last_timestamp + 41666 {
+            last_timestamp = pix.timestamp;
+
+            // used for setting gamma
+            let max_value = map.iter().max().ok_or_else(|| anyhow!("a"))?;
+
+            for c in map.chunks_exact(8) {
+                let mut chunk: [u16; 8] = c.try_into()?;
+
+                // scale for gamma
+
+                //scale_values2(&mut chunk);
+                scale_values(&mut chunk, *max_value);
+                fast_heatmap::get_color_block(chunk, &mut img_buf);
+                w.write_all(convert(&img_buf))?;
+            }
+        }
+    }
 
     Ok(())
 }
 
-fn read_record(record: StringRecord, map: &mut HashMap<String, i64>, count: &mut i64) -> anyhow::Result<RedditPixel> {
-    let a = record.get(0).ok_or(anyhow!("bad format"))?;
-    let timestamp = date_components_to_timestamp(read_date(a)?)?;
-
-    let string_id = record.get(1).ok_or(anyhow!("bad format"))?;
-    let id;
-    if let Some(e) = map.get(string_id) {
-        id = *e;
-    } else {
-        *count += 1;
-        id = *count;
-        map.insert(string_id.to_string(), id);
+fn scale_values(buf: &mut [u16; 8], mut x: u16) {
+    if x == 0 {
+        x = 1;
     }
 
-    let b = record.get(2).ok_or(anyhow!("bad format"))?;
+    let x_sqrt = (x as f64).powf(1.0/4.0);
+
+    // Calculate the scaled value
+    for a in buf {
+
+        let mut t = *a as f64 * u16::MAX as f64 / x as f64;
+        t = t.powf(1.0/4.0);
+        t = t * u16::MAX as f64 / x_sqrt;
+        *a = t as u16;
+    }
+}
+
+
+fn read_record(record: StringRecord) -> anyhow::Result<RedditPixel> {
+    let a = record.get(0).ok_or_else(|| anyhow!("bad format"))?;
+    let timestamp = date_components_to_timestamp(read_date(a)?)?;
+
+    let string_id = record.get(1).ok_or_else(|| anyhow!("bad format"))?;
+    let id = 0;
+
+    let b = record.get(2).ok_or_else(|| anyhow!("bad format"))?;
     let coords = read_coords(b)?;
 
-    let c = record.get(3).ok_or(anyhow!("bad format"))?;
+    let c = record.get(3).ok_or_else(|| anyhow!("bad format"))?;
     let color = read_color(c)?;
-
-
 
     Ok(RedditPixel {
         timestamp,
@@ -91,7 +138,7 @@ fn read_record(record: StringRecord, map: &mut HashMap<String, i64>, count: &mut
         y: coords.1,
         x1: coords.2,
         y1: coords.3,
-        color
+        color,
     })
 }
 
@@ -101,7 +148,7 @@ fn read_date(text: &str) -> anyhow::Result<[u32; 7]> {
     let mut multiplier = 10000u32;
     for c in text.chars() {
         if c.is_ascii_digit() {
-            components[current] += c.to_digit(10).ok_or(anyhow!("bad digit"))? * multiplier;
+            components[current] += c.to_digit(10).ok_or_else(|| anyhow!("bad digit"))? * multiplier;
             multiplier /= 10;
         } else {
             if current >= components.len() {
@@ -120,7 +167,7 @@ fn date_components_to_timestamp(c: [u32; 7]) -> anyhow::Result<i64> {
     let dt = Utc
         .with_ymd_and_hms(c[0].try_into()?, c[1], c[2], c[3], c[4], c[5])
         .earliest()
-        .ok_or(anyhow!(""))?;
+        .ok_or_else(|| anyhow!("time"))?;
 
     Ok(dt.timestamp_millis() + (c[6] as i64))
 }
@@ -137,8 +184,13 @@ fn read_coords(text: &str) -> anyhow::Result<(i32, i32, i32, i32)> {
     match comma_indices.len() {
         1 => {
             let first = &text[0..comma_indices[0]];
-            let second = &text[comma_indices[0]+1..];
-            Ok((i32::from_str_radix(first, 10)?, i32::from_str_radix(second, 10)?, i32::MAX, i32::MAX))
+            let second = &text[comma_indices[0] + 1..];
+            Ok((
+                i32::from_str_radix(first, 10)?,
+                i32::from_str_radix(second, 10)?,
+                i32::MAX,
+                i32::MAX,
+            ))
         }
         2 => {
             // these idiots put JSON in my CSV ffs
@@ -149,28 +201,38 @@ fn read_coords(text: &str) -> anyhow::Result<(i32, i32, i32, i32)> {
                     colon_indices.push(index);
                 }
             }
-            let first = &text[colon_indices[0]+2..comma_indices[0]];
-            let second = &text[colon_indices[1]+2..comma_indices[1]];
-            let third = &text[colon_indices[2]+2..text.len()-1];
+            let first = &text[colon_indices[0] + 2..comma_indices[0]];
+            let second = &text[colon_indices[1] + 2..comma_indices[1]];
+            let third = &text[colon_indices[2] + 2..text.len() - 1];
             //println!("Mod circle");
-            Ok((i32::from_str_radix(first, 10)?, i32::from_str_radix(second, 10)?, i32::from_str_radix(third, 10)?, i32::MAX))
+            Ok((
+                i32::from_str_radix(first, 10)?,
+                i32::from_str_radix(second, 10)?,
+                i32::from_str_radix(third, 10)?,
+                i32::MAX,
+            ))
         }
         3 => {
             let first = &text[0..comma_indices[0]];
-            let second = &text[comma_indices[0]+1..comma_indices[1]];
-            let third = &text[comma_indices[1]+1..comma_indices[2]];
-            let fourth = &text[comma_indices[2]+1..];
+            let second = &text[comma_indices[0] + 1..comma_indices[1]];
+            let third = &text[comma_indices[1] + 1..comma_indices[2]];
+            let fourth = &text[comma_indices[2] + 1..];
             //println!("Mod rectangle");
-            Ok((i32::from_str_radix(first, 10)?, i32::from_str_radix(second, 10)?, i32::from_str_radix(third, 10)?, i32::from_str_radix(fourth, 10)?))
+            Ok((
+                i32::from_str_radix(first, 10)?,
+                i32::from_str_radix(second, 10)?,
+                i32::from_str_radix(third, 10)?,
+                i32::from_str_radix(fourth, 10)?,
+            ))
         }
-        _ => Err(anyhow!("formatting error"))
+        _ => Err(anyhow!("formatting error")),
     }
 }
 
 fn read_color(text: &str) -> anyhow::Result<u32> {
     Ok(u32::from_str_radix(&text[1..], 16)?)
 
-/*
+    /*
     // set alpha
     let color = Colors::try_from_primitive((0xFF << 24) | color_value)?;
     Ok(get_color_id(color)) */
@@ -184,13 +246,12 @@ struct RedditPixel {
     y: i32,
     x1: i32,
     y1: i32,
-    color: u32
+    color: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
 #[repr(u32)]
-enum Colors
-{
+enum Colors {
     Burgundy = 4279894125,
     DarkRed = 4281925822,
     Red = 4278207999,
@@ -222,11 +283,10 @@ enum Colors
     DarkGray = 4283585105,
     Gray = 4287663497,
     LightGray = 4292466644,
-    White = 4294967295
+    White = 4294967295,
 }
 
-fn get_color_id(c: Colors) -> u8
-{
+fn get_color_id(c: Colors) -> u8 {
     match c {
         Colors::Burgundy => 0,
         Colors::DarkRed => 1,
@@ -259,6 +319,6 @@ fn get_color_id(c: Colors) -> u8
         Colors::DarkGray => 28,
         Colors::Gray => 29,
         Colors::LightGray => 30,
-        Colors::White => 31
+        Colors::White => 31,
     }
 }

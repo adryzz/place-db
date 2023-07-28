@@ -9,6 +9,13 @@ edition = "2021"
 anyhow = "1.0.72"
 chrono = "0.4.26"
 csv = "1.2.2"
+fast-heatmap = "0.1.0"
 flate2 = "1.0.26"
+itertools = "0.11.0"
+num-integer = "0.1.45"
 num_enum = "0.6.1"
 rayon = "1.7.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
