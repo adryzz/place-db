@@ -76,9 +76,9 @@ fn read_csv_gzip_file(
         let pix = read_record(record?)?;
         let x = pix.x + 1500;
         let y = pix.y + 1000;
-        map[((y * 3000) + x) as usize] += 1;
+        map[((y * 3000) + x) as usize] += 1024;
 
-        if pix.timestamp > last_timestamp + 41666 {
+        if pix.timestamp > last_timestamp + 27777 {
             last_timestamp = pix.timestamp;
 
             // used for setting gamma
@@ -94,6 +94,8 @@ fn read_csv_gzip_file(
                 fast_heatmap::get_color_block(chunk, &mut img_buf);
                 w.write_all(convert(&img_buf))?;
             }
+
+            map.iter_mut().for_each(|a| *a /= 2);
         }
     }
 
